@@ -8,6 +8,7 @@ from typing import (
     Optional,
     Set,
     Tuple,
+    Type,
     Union,
     cast,
 )
@@ -17,6 +18,7 @@ import dataclasses
 import logging
 import time
 
+import ceph.smb.constants
 from ceph.deployment.service_spec import SMBExternalCephCluster, SMBSpec
 from ceph.fs.earmarking import EarmarkTopScope
 
@@ -33,11 +35,13 @@ from .enums import (
 )
 from .internal import (
     ClusterEntry,
+    CommonResourceEntry,
     ExternalCephClusterEntry,
     JoinAuthEntry,
     ShareEntry,
     TLSCredentialEntry,
     UsersAndGroupsEntry,
+    map_resource_entry,
 )
 from .proto import (
     AccessAuthorizer,
@@ -238,6 +242,9 @@ class _Matcher:
             f'{txt!r} does not match a valid resource type'
         )
 
+    def resources(self) -> List[Type[SMBResource]]:
+        return list(self._match_resources)
+
 
 class ClusterConfigHandler:
     """The central class for ingesting and handling smb configuration change
@@ -382,6 +389,7 @@ class ClusterConfigHandler:
     def _search_resources(self, matcher: _Matcher) -> List[SMBResource]:
         log.debug("performing search with matcher: %s", matcher)
         out: List[SMBResource] = []
+        # clusters and shares (with parent-child relationship)
         if resources.Cluster in matcher or resources.Share in matcher:
             log.debug("searching for clusters and/or shares")
             cluster_shares = self.share_ids_by_cluster()
@@ -395,21 +403,20 @@ class ClusterConfigHandler:
                                 cluster_id, share_id
                             ).get_share()
                         )
-        _resources = (
-            (resources.JoinAuth, JoinAuthEntry),
-            (resources.UsersAndGroups, UsersAndGroupsEntry),
-            (resources.TLSCredential, TLSCredentialEntry),
-        )
-        for rtype, ecls in _resources:
-            if rtype in matcher:
-                log.debug("searching for %s", cast(Any, rtype).resource_type)
-                out.extend(
-                    ecls.from_store(
-                        self.internal_store, rid
-                    ).get_resource_type(rtype)
-                    for rid in ecls.ids(self.internal_store)
-                    if (rtype, rid) in matcher
-                )
+        # other common top-level resources
+        for rtype in matcher.resources():
+            if rtype in (resources.Cluster, resources.Share):
+                continue  # already handled above
+            if rtype not in matcher:
+                continue
+            log.debug("searching for %s", cast(Any, rtype).resource_type)
+            ecls = map_resource_entry(rtype)
+            assert issubclass(ecls, CommonResourceEntry)
+            for rid in ecls.ids(self.internal_store):
+                if (rtype, rid) in matcher:
+                    entry = ecls.from_store(self.internal_store, rid)
+                    res = entry.get_resource_type(rtype)
+                    out.append(cast(SMBResource, res))
         log.debug("search found %d resources", len(out))
         return out
 
@@ -944,6 +951,7 @@ def _generate_config(conf: _ClusterConf) -> Dict[str, Any]:
         cluster_global_opts['idmap config * : backend'] = 'autorid'
         cluster_global_opts['idmap config * : range'] = '2000-9999999'
     cluster_global_opts['smb ports'] = str(_smb_port(cluster))
+    _set_debug_level(cluster_global_opts, conf)
 
     share_configs = {
         share.resource.name: _generate_share(share) for share in conf.shares
@@ -1069,6 +1077,7 @@ def _generate_smb_service_spec(
         remote_control_ssl_key=rc_key,
         remote_control_ca_cert=rc_ca_cert,
         ceph_cluster_configs=ceph_cluster_configs,
+        tunables=_service_spec_tunables(cluster),
     )
 
 
@@ -1235,3 +1244,61 @@ def _tls_uri(
         return None
     uri = tls_credential_entries[src.ref].uri
     return f'URI:{uri}'
+
+
+def _get_log_level(cluster: resources.Cluster, key: str) -> str:
+    if not cluster.debug_level:
+        return ''
+    return str(cluster.debug_level.get(key) or '').upper()
+
+
+def _smb_log_level(cluster: resources.Cluster) -> str:
+    level = orig = _get_log_level(cluster, 'samba')
+    if not level:
+        return ''
+    if level.isdigit():
+        return level
+    # tier mapping
+    for word, low, hi in ceph.smb.constants.DEBUG_LEVEL_TIERS:
+        if level == word:
+            level = str(hi)
+    if not level:
+        level = '1'
+    log.info('Mapped debug level %s to %s', orig, level)
+    return level
+
+
+def _ctdb_log_level(cluster: resources.Cluster) -> str:
+    level = orig = _get_log_level(cluster, 'ctdb')
+    if not level:
+        return ''
+    if level in ceph.smb.constants.DEBUG_LEVEL_TERMS:
+        return level
+    # tier mapping
+    for word, low, hi in ceph.smb.constants.DEBUG_LEVEL_TIERS:
+        try:
+            lval = int(level)
+        except ValueError:
+            continue
+        if lval in range(low, hi + 1):
+            level = word
+    if not level:
+        level = 'INFO'
+    log.info('Mapped debug level %s to %s', orig, level)
+    return level
+
+
+def _set_debug_level(opts: Dict[str, Any], conf: _ClusterConf) -> None:
+    level = _smb_log_level(conf.resource)
+    if not level:
+        return
+    opts['log level'] = level
+
+
+def _service_spec_tunables(
+    cluster: resources.Cluster,
+) -> Optional[Dict[str, str]]:
+    level = _ctdb_log_level(cluster)
+    if not level:
+        return None
+    return {'log_level.ctdb': level}
